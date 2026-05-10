@@ -1,8 +1,18 @@
 """
-TestRail Plan Entry 날짜 설정 도구
+TestRail Plan Entry 날짜 설정 도구  v2
   - 기존 Test Plan 선택 → Suite(Run) 목록 확인
   - 달력 GUI 로 Start Date / End Date 클릭 입력
   - TestRail API update_plan_entry 로 저장
+
+  v2 신규 기능:
+    1. 날짜 범위 유효성 검사  -- Start > End 이면 행 상태 라벨에 실시간 경고 표시
+    2. Run 이름 필터 / 검색   -- 두 번째 툴바 우측 검색창으로 즉시 필터링
+    3. 날짜 자동 계산         -- 시작일 + N일 기간 + gap일 간격으로 체크된 Run에 순차 배분
+
+  버그 수정 (v1 -> v2):
+    [fix1] trace_add 누적 메모리 릭 -- Plan 전환 시 이전 StringVar 트레이스 명시적 제거
+    [fix2] 필터 숨김 행 side-effect -- Select All / Bulk Date / Auto Assign 이
+           숨겨진 행에도 적용되던 문제 수정 (winfo_ismapped 로 가시 행만 대상)
 """
 
 import os
@@ -12,7 +22,7 @@ import urllib3
 import tkinter as tk
 from tkinter import ttk, messagebox
 import calendar
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 
 __author__ = "junghun.lee"
@@ -155,6 +165,7 @@ class CalendarPopup(tk.Toplevel):
     def _render_calendar(self):
         self._lbl_month.config(text=f"{self._year}.{self._month:02d}")
 
+        calendar.setfirstweekday(6)  # Su=0 기준으로 헤더(Su Mo Tu We Th Fr Sa)와 맞춤
         cal_matrix = calendar.monthcalendar(self._year, self._month)
         while len(cal_matrix) < 6:
             cal_matrix.append([0] * 7)
@@ -281,13 +292,19 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("TestRail — Plan Entry Date Setter")
+        self.title("TestRail — Plan Entry Date Setter  v2")
         self.configure(bg=self.BG)
         self.resizable(False, False)
 
         self._plans    = []
         self._entries  = []
         self._run_rows = []
+
+        # v2: 검색 / 자동 날짜 배분용 변수
+        self._search_var     = tk.StringVar()
+        self._auto_start_var = tk.StringVar()
+        self._auto_days_var  = tk.StringVar(value="7")
+        self._auto_gap_var   = tk.StringVar(value="0")
 
         style = ttk.Style(self)
         style.theme_use("clam")
@@ -307,7 +324,7 @@ class App(tk.Tk):
         )
 
         # 창 크기 고정 (항목 수와 무관하게 일정 유지)
-        self.geometry("860x620")
+        self.geometry("860x680")  # v2: toolbar2 추가
         self._build_ui()
         self._load_plans()
         self._center()
@@ -351,7 +368,7 @@ class App(tk.Tk):
                            padx=16, pady=7,
                            highlightbackground=self.BORDER,
                            highlightthickness=1)
-        toolbar.pack(fill="x", padx=16, pady=(0, 2))
+        toolbar.pack(fill="x", padx=16, pady=(0, 0))
 
         btn_kw = dict(relief="flat", bd=0, cursor="hand2",
                       font=("Segoe UI", 9),
@@ -415,6 +432,54 @@ class App(tk.Tk):
                   bg="#34A853", fg="white",
                   activebackground="#2d8f47", activeforeground="white",
                   **btn_kw).pack(side="left")
+
+        # -- 툴바2: Auto-Date + 검색 (v2 신규) --
+        toolbar2 = tk.Frame(self, bg=self.TOOLBAR,
+                            padx=16, pady=7,
+                            highlightbackground=self.BORDER,
+                            highlightthickness=1)
+        toolbar2.pack(fill="x", padx=16, pady=(0, 2))
+
+        tk.Label(toolbar2, text="Auto-Date:",
+                 bg=self.TOOLBAR, fg=self.SUBTEXT,
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        tk.Entry(toolbar2, textvariable=self._auto_start_var,
+                 width=11, bg=self.SURFACE, fg=self.TEXT,
+                 relief="solid", bd=1, font=("Segoe UI", 9), state="readonly"
+                 ).pack(side="left", padx=(6, 2))
+        tk.Button(toolbar2, text="📅",
+                  command=lambda: self._pick_date(self._auto_start_var, "Auto-Date: Start"),
+                  bg=self.TOOLBAR, fg="#4A90D9", relief="flat", bd=0, cursor="hand2",
+                  font=("Segoe UI", 10), activebackground=self.BTN_GHOST
+                  ).pack(side="left", padx=(0, 10))
+        tk.Label(toolbar2, text="Days:", bg=self.TOOLBAR, fg=self.SUBTEXT,
+                 font=("Segoe UI", 9)).pack(side="left")
+        tk.Entry(toolbar2, textvariable=self._auto_days_var,
+                 width=4, bg=self.SURFACE, fg=self.TEXT,
+                 relief="solid", bd=1, font=("Segoe UI", 9)
+                 ).pack(side="left", padx=(4, 10))
+        tk.Label(toolbar2, text="Gap:", bg=self.TOOLBAR, fg=self.SUBTEXT,
+                 font=("Segoe UI", 9)).pack(side="left")
+        tk.Entry(toolbar2, textvariable=self._auto_gap_var,
+                 width=4, bg=self.SURFACE, fg=self.TEXT,
+                 relief="solid", bd=1, font=("Segoe UI", 9)
+                 ).pack(side="left", padx=(4, 10))
+        tk.Button(toolbar2, text="Auto Assign",
+                  command=self._auto_assign_dates,
+                  bg="#E67E22", fg="white",
+                  activebackground="#CA6F1E", activeforeground="white",
+                  **btn_kw).pack(side="left", padx=(0, 16))
+        tk.Frame(toolbar2, bg=self.BORDER, width=1).pack(side="left", fill="y", padx=(0, 12))
+        tk.Label(toolbar2, text="🔍", bg=self.TOOLBAR, fg=self.SUBTEXT,
+                 font=("Segoe UI", 10)).pack(side="left")
+        tk.Entry(toolbar2, textvariable=self._search_var,
+                 width=22, bg=self.SURFACE, fg=self.TEXT,
+                 relief="solid", bd=1, font=("Segoe UI", 9)
+                 ).pack(side="left", padx=(4, 6))
+        self._lbl_filter_count = tk.Label(toolbar2, text="",
+                 bg=self.TOOLBAR, fg=self.SUBTEXT, font=("Segoe UI", 9))
+        self._lbl_filter_count.pack(side="left")
+        self._search_var.trace_add("write", self._filter_runs)
 
         # Run 테이블
         tbl_wrap = tk.Frame(self, bg=self.BG, padx=16, pady=4)
@@ -678,6 +743,14 @@ class App(tk.Tk):
 
     # ── Run 행 렌더링 ─────────────────────────
     def _render_runs(self):
+        # [fix1] 이전 StringVar 트레이스 명시적 제거
+        for row in self._run_rows:
+            for var, mode, tid in row.get("_trace_ids", []):
+                try:
+                    var.trace_remove(mode, tid)
+                except Exception:
+                    pass
+
         for w in self._scroll_fr.winfo_children():
             w.destroy()
         self._run_rows.clear()
@@ -686,15 +759,18 @@ class App(tk.Tk):
             tk.Label(self._scroll_fr, text="No runs found.",
                      bg=self.SURFACE, fg=self.SUBTEXT,
                      font=("Segoe UI", 10), pady=24).pack()
+            self._lbl_filter_count.config(text="0", fg=self.SUBTEXT)
             return
 
         for i, entry in enumerate(self._entries):
             row_bg    = self.SURFACE if i % 2 == 0 else self.ROW_ALT
             bar_color = self.ROW_COLORS[i % len(self.ROW_COLORS)]
 
-            # 구분선
+            # 구분선 (row 0은 없음)
+            divider_fr = None
             if i > 0:
-                tk.Frame(self._scroll_fr, bg=self.BORDER, height=1).pack(fill="x")
+                divider_fr = tk.Frame(self._scroll_fr, bg=self.BORDER, height=1)
+                divider_fr.pack(fill="x")
 
             row_fr = tk.Frame(self._scroll_fr, bg=row_bg)
             row_fr.pack(fill="x")
@@ -790,22 +866,42 @@ class App(tk.Tk):
                                    font=("Segoe UI", 9), width=10, anchor="w")
             status_lbl.grid(row=0, column=8, padx=(2, 8))
 
-            self._run_rows.append({
-                "entry"     : entry,
-                "chk_var"   : chk_var,
-                "start_var" : start_var,
-                "end_var"   : end_var,
+            row_data = {
+                "entry":      entry,
+                "chk_var":    chk_var,
+                "start_var":  start_var,
+                "end_var":    end_var,
                 "status_lbl": status_lbl,
-            })
+                "row_fr":     row_fr,
+                "divider":    divider_fr,
+                "_trace_ids": [],
+            }
+            self._run_rows.append(row_data)
+
+            # [fix1] row_data 완성 후 트레이스 등록
+            tid_s = start_var.trace_add("write", lambda *a, r=row_data: self._validate_row(r))
+            tid_e = end_var.trace_add("write",   lambda *a, r=row_data: self._validate_row(r))
+            row_data["_trace_ids"] = [
+                (start_var, "write", tid_s),
+                (end_var,   "write", tid_e),
+            ]
+            self._validate_row(row_data)
+
+        # 행 생성 완료 후 검색어 초기화
+        self._search_var.set("")
 
     # ── Select All / Deselect All ────────────
     def _select_all(self):
+        # [fix2] 필터로 숨겨진 행 제외
         for row in self._run_rows:
-            row["chk_var"].set(True)
+            if row["row_fr"].winfo_ismapped():
+                row["chk_var"].set(True)
 
     def _deselect_all(self):
+        # [fix2] 필터로 숨겨진 행 제외
         for row in self._run_rows:
-            row["chk_var"].set(False)
+            if row["row_fr"].winfo_ismapped():
+                row["chk_var"].set(False)
 
     # ── Bulk Date 일괄 적용 ───────────────────
     def _apply_bulk_dates(self):
@@ -827,7 +923,9 @@ class App(tk.Tk):
             except ValueError:
                 pass
 
-        targets = [r for r in self._run_rows if r["chk_var"].get()]
+        # [fix2] 가시 행 + 체크된 행에만 적용
+        targets = [r for r in self._run_rows
+                   if r["chk_var"].get() and r["row_fr"].winfo_ismapped()]
         if not targets:
             messagebox.showwarning("Warning", "No runs selected (checked).")
             return
@@ -844,6 +942,116 @@ class App(tk.Tk):
             text=f"Bulk applied to {applied} run(s)  —  click Save to confirm",
             fg="#856404"
         )
+
+
+    # =============================================
+    # v2 신규 메서드
+    # =============================================
+
+    def _validate_row(self, row):
+        """Start > End 이면 상태 라벨에 경고 표시, 정상이면 경고 제거."""
+        s = row["start_var"].get()
+        e = row["end_var"].get()
+        lbl = row.get("status_lbl")
+        if lbl is None:
+            return
+        if s and e:
+            try:
+                if datetime.strptime(s, "%Y-%m-%d") > datetime.strptime(e, "%Y-%m-%d"):
+                    lbl.config(text="⚠ Start>End", fg=self.RED)
+                    return
+            except ValueError:
+                pass
+        if lbl.cget("text") == "⚠ Start>End":
+            lbl.config(text="", fg=self.SUBTEXT)
+
+    def _collect_invalid_rows(self, targets):
+        """저장 전 날짜 역전 / 포맷 오류 검사 -> 에러 메시지 목록 반환."""
+        errors = []
+        for row in targets:
+            s = row["start_var"].get()
+            e = row["end_var"].get()
+            if s and e:
+                try:
+                    if datetime.strptime(s, "%Y-%m-%d") > datetime.strptime(e, "%Y-%m-%d"):
+                        errors.append(
+                            f"'{row['entry']['name']}': Start Date is after End Date")
+                except ValueError:
+                    errors.append(
+                        f"'{row['entry']['name']}': Invalid date format")
+        return errors
+
+    def _filter_runs(self, *args):
+        """검색어 일치 행만 표시. pack_forget-all -> repack 으로 표시 순서 보존."""
+        if not self._run_rows:
+            self._lbl_filter_count.config(text="", fg=self.SUBTEXT)
+            return
+        query     = self._search_var.get().strip().lower()
+        filtering = (query != "")
+        for row in self._run_rows:
+            row["row_fr"].pack_forget()
+            if row.get("divider") is not None:
+                row["divider"].pack_forget()
+        visible       = 0
+        first_visible = True
+        for row in self._run_rows:
+            matched = not filtering or (query in row["entry"]["name"].lower())
+            if matched:
+                divider = row.get("divider")
+                if divider is not None and not first_visible and not filtering:
+                    divider.pack(fill="x")
+                row["row_fr"].pack(fill="x")
+                first_visible = False
+                visible += 1
+        total = len(self._run_rows)
+        if filtering:
+            self._lbl_filter_count.config(
+                text=f"{visible}/{total}",
+                fg=self.GREEN if visible > 0 else self.RED)
+        else:
+            self._lbl_filter_count.config(text=str(total), fg=self.SUBTEXT)
+
+    def _auto_assign_dates(self):
+        """체크된 가시 Run에 시작일 + N일 기간 + gap일 간격으로 날짜 순차 배분."""
+        start_str = self._auto_start_var.get()
+        if not start_str:
+            messagebox.showwarning("Warning", "Auto-Date: Start Date를 먼저 선택해주세요.")
+            return
+        try:
+            days = int(self._auto_days_var.get())
+            if days < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "Days는 1 이상의 정수를 입력해주세요.")
+            return
+        try:
+            gap = int(self._auto_gap_var.get())
+            if gap < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "Gap은 0 이상의 정수를 입력해주세요.")
+            return
+        try:
+            base_start = datetime.strptime(start_str, "%Y-%m-%d").date()
+        except ValueError:
+            messagebox.showerror("Error", "Auto-Date Start 날짜 형식 오류 (YYYY-MM-DD)")
+            return
+        # [fix2] 가시 행 + 체크된 행에만 적용
+        targets = [r for r in self._run_rows
+                   if r["chk_var"].get() and r["row_fr"].winfo_ismapped()]
+        if not targets:
+            messagebox.showwarning("Warning",
+                "체크된 Run이 없거나 현재 필터에 표시된 Run이 없습니다.")
+            return
+        cursor = base_start
+        for row in targets:
+            run_end = cursor + timedelta(days=days - 1)
+            row["start_var"].set(cursor.strftime("%Y-%m-%d"))
+            row["end_var"].set(run_end.strftime("%Y-%m-%d"))
+            cursor = run_end + timedelta(days=gap + 1)
+        self._lbl_status.config(
+            text=f"Auto-Date: {len(targets)} run(s) 배분 완료  —  Save 버튼으로 저장",
+            fg="#856404")
 
     # ── 달력 팝업 ─────────────────────────────
     def _pick_date(self, str_var, title="Select Date"):
@@ -866,20 +1074,8 @@ class App(tk.Tk):
             messagebox.showwarning("Warning", "No runs selected.")
             return
 
-        errors = []
-        for row in targets:
-            s = row["start_var"].get()
-            e = row["end_var"].get()
-            if s and e:
-                try:
-                    if datetime.strptime(s, "%Y-%m-%d") > datetime.strptime(e, "%Y-%m-%d"):
-                        errors.append(f"'{row['entry']['name']}': Start Date is after End Date")
-                except ValueError:
-                    errors.append(f"'{row['entry']['name']}': Invalid date format")
-
-        if errors:
-            messagebox.showerror("Date Error", "\n".join(errors))
-            return
+        # [v2] 날짜 역전 / 포맷 오류 사전 검사
+        errors = self._collect_invalid_rows(targets)
 
         if not messagebox.askyesno("Confirm Save",
                                     f"Save dates for {len(targets)} run(s)?"):
