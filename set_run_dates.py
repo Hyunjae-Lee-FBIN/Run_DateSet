@@ -590,7 +590,7 @@ class App(tk.Tk):
             ms_name = ms_map.get(p.get("milestone_id"), "")
             ms_tag  = f"  [{ms_name}]" if ms_name else ""
             combined.append({
-                "label" : f"[Plan] {p['name']}{ms_tag}",
+                "label" : f"[Plan] {p['name']}",
                 "type"  : "plan",
                 "id"    : p["id"],
                 "name"  : p["name"],
@@ -616,7 +616,7 @@ class App(tk.Tk):
                     ms_label = ms_map.get(ms_id, "")
                     ms_tag   = f"  [{ms_label}]" if ms_label else ""
                     combined.append({
-                        "label"        : f"[Run]  {r['name']}{ms_tag}",
+                        "label"        : f"[Run]  {r['name']}",
                         "type"         : "run",
                         "id"           : r["id"],
                         "name"         : r["name"],
@@ -638,7 +638,7 @@ class App(tk.Tk):
                 ms_label = ms_map.get(ms_id, "") if ms_id else ""
                 ms_tag   = f"  [{ms_label}]" if ms_label else ""
                 combined.append({
-                    "label"        : f"[Run]  {r['name']}{ms_tag}  (ID: {r['id']})",
+                    "label"        : f"[Run]  {r['name']}",
                     "type"         : "run",
                     "id"           : r["id"],
                     "name"         : r["name"],
