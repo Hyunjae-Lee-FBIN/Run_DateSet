@@ -1,20 +1,3 @@
-"""
-TestRail Plan Entry 날짜 설정 도구  v2
-  - 기존 Test Plan 선택 → Suite(Run) 목록 확인
-  - 달력 GUI 로 Start Date / End Date 클릭 입력
-  - TestRail API update_plan_entry 로 저장
-
-  v2 신규 기능:
-    1. 날짜 범위 유효성 검사  -- Start > End 이면 행 상태 라벨에 실시간 경고 표시
-    2. Run 이름 필터 / 검색   -- 두 번째 툴바 우측 검색창으로 즉시 필터링
-    3. 날짜 자동 계산         -- 시작일 + N일 기간 + gap일 간격으로 체크된 Run에 순차 배분
-
-  버그 수정 (v1 -> v2):
-    [fix1] trace_add 누적 메모리 릭 -- Plan 전환 시 이전 StringVar 트레이스 명시적 제거
-    [fix2] 필터 숨김 행 side-effect -- Select All / Bulk Date / Auto Assign 이
-           숨겨진 행에도 적용되던 문제 수정 (winfo_ismapped 로 가시 행만 대상)
-"""
-
 import os
 import sys
 import requests
@@ -22,7 +5,7 @@ import urllib3
 import tkinter as tk
 from tkinter import ttk, messagebox
 import calendar
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from dotenv import load_dotenv
 
 __author__ = "junghun.lee"
@@ -40,6 +23,7 @@ PROJECT_ID = int(os.getenv("TESTRAIL_PROJECT_ID", "0"))
 if BASE_URL and not BASE_URL.startswith("http"):
     BASE_URL = "https://" + BASE_URL
 
+
 def api_get(endpoint):
     res = requests.get(
         f"{BASE_URL}/index.php?/api/v2/{endpoint}",
@@ -49,12 +33,40 @@ def api_get(endpoint):
         return {}
     return res.json()
 
+
+# [fix6] 페이지네이션 헬퍼 -- limit/offset 으로 전체 레코드를 순차 로드
+def api_get_paged(base_endpoint, list_key, limit=250):
+    results = []
+    offset  = 0
+    while True:
+        data  = api_get(f"{base_endpoint}&limit={limit}&offset={offset}")
+        items = data.get(list_key, [])
+        results.extend(items)
+        if len(items) < limit:
+            break
+        offset += limit
+    return results
+
+
 def api_post(endpoint, payload=None):
     res = requests.post(
         f"{BASE_URL}/index.php?/api/v2/{endpoint}",
         auth=AUTH, verify=False, json=payload or {}
     )
     return res
+
+
+# [fix5] UTC 기준 날짜 변환 헬퍼
+def ts_to_date_str(ts):
+    """Unix timestamp → YYYY-MM-DD (UTC)"""
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def date_str_to_ts(date_str):
+    """YYYY-MM-DD → Unix timestamp (UTC midnight)"""
+    return int(datetime.strptime(date_str, "%Y-%m-%d")
+               .replace(tzinfo=timezone.utc).timestamp())
+
 
 # ══════════════════════════════════════════════
 # 달력 팝업 위젯  (라이트 테마)
@@ -95,7 +107,6 @@ class CalendarPopup(tk.Toplevel):
         self._center(parent)
 
     def _build_ui(self):
-        # 헤더
         hdr = tk.Frame(self, bg=self.HEADER_BG, padx=10, pady=8)
         hdr.pack(fill="x")
 
@@ -116,7 +127,6 @@ class CalendarPopup(tk.Toplevel):
         )
         self._lbl_month.pack(side="left", expand=True)
 
-        # 요일 헤더
         dow_fr = tk.Frame(self, bg="#f8f9fa", pady=5)
         dow_fr.pack(fill="x")
         for i, d in enumerate(["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]):
@@ -128,7 +138,6 @@ class CalendarPopup(tk.Toplevel):
 
         tk.Frame(self, bg=self.BORDER, height=1).pack(fill="x")
 
-        # 날짜 그리드
         self._cal_frame = tk.Frame(self, bg=self.BG, padx=8, pady=6)
         self._cal_frame.pack()
 
@@ -165,7 +174,7 @@ class CalendarPopup(tk.Toplevel):
     def _render_calendar(self):
         self._lbl_month.config(text=f"{self._year}.{self._month:02d}")
 
-        calendar.setfirstweekday(6)  # Su=0 기준으로 헤더(Su Mo Tu We Th Fr Sa)와 맞춤
+        calendar.setfirstweekday(6)
         cal_matrix = calendar.monthcalendar(self._year, self._month)
         while len(cal_matrix) < 6:
             cal_matrix.append([0] * 7)
@@ -284,15 +293,18 @@ class App(tk.Tk):
     HDR_BG    = "#D6E4F7"
     BTN_GHOST = "#e9ecef"
     TOOLBAR   = "#f0f4f8"
-    # 행별 좌측 바 색상 풀 (Suite 구분용)
     ROW_COLORS = [
         "#4A90D9", "#34A853", "#E67E22", "#9B59B6",
         "#E91E63", "#00ACC1", "#F4511E", "#43A047",
     ]
 
+    #        c0  c1  c2   c3   c4  c5   c6  c7   c8
+    #       bar chk  no  name  sd  📅   ed  📅  status
+    COL_W = [5,  28,  30, 220, 110, 30, 110, 30,  90]
+
     def __init__(self):
         super().__init__()
-        self.title("TestRail — Plan Entry Date Setter  v2")
+        self.title("TestRail — Plan Entry Date Setter  v3")
         self.configure(bg=self.BG)
         self.resizable(False, False)
 
@@ -300,7 +312,6 @@ class App(tk.Tk):
         self._entries  = []
         self._run_rows = []
 
-        # v2: 검색 / 자동 날짜 배분용 변수
         self._search_var     = tk.StringVar()
         self._auto_start_var = tk.StringVar()
         self._auto_days_var  = tk.StringVar(value="7")
@@ -323,14 +334,12 @@ class App(tk.Tk):
             arrowcolor=self.SUBTEXT
         )
 
-        # 창 크기 고정 (항목 수와 무관하게 일정 유지)
-        self.geometry("860x680")  # v2: toolbar2 추가
+        self.geometry("860x680")
         self._build_ui()
         self._load_plans()
         self._center()
 
     def _build_ui(self):
-        # 헤더 바
         hdr = tk.Frame(self, bg=self.HEADER_BG, padx=20, pady=12)
         hdr.pack(fill="x")
         tk.Label(hdr, text="TestRail  |  Plan Entry Date Setter",
@@ -340,7 +349,6 @@ class App(tk.Tk):
                  bg=self.HEADER_BG, fg="#cce0f5",
                  font=("Segoe UI", 9)).pack(side="right")
 
-        # Plan 선택 카드
         plan_card = tk.Frame(self, bg=self.SURFACE,
                              padx=20, pady=12,
                              highlightbackground=self.BORDER,
@@ -386,7 +394,6 @@ class App(tk.Tk):
                   activebackground=self.BORDER, activeforeground=self.TEXT,
                   **btn_kw).pack(side="left", padx=(0, 16))
 
-        # 구분선
         tk.Frame(toolbar, bg=self.BORDER, width=1).pack(side="left", fill="y", padx=(0, 12))
 
         tk.Label(toolbar, text="Bulk Date:",
@@ -433,7 +440,7 @@ class App(tk.Tk):
                   activebackground="#2d8f47", activeforeground="white",
                   **btn_kw).pack(side="left")
 
-        # -- 툴바2: Auto-Date + 검색 (v2 신규) --
+        # ── 툴바2: Auto-Date + 검색 ──
         toolbar2 = tk.Frame(self, bg=self.TOOLBAR,
                             padx=16, pady=7,
                             highlightbackground=self.BORDER,
@@ -490,15 +497,10 @@ class App(tk.Tk):
                            highlightthickness=1)
         hdr_row.pack(fill="x")
 
-        # 컬럼 너비 정의 (픽셀) — 헤더/행 공통 기준
-        COL_W = [5, 28, 30, 220, 110, 30, 110, 30, 90]
-        #        c0  c1  c2   c3   c4  c5   c6  c7   c8
-        #       bar chk  no  name  sd  📅   ed  📅  status
-
         for c, (txt, px) in enumerate(zip(
             ["", "", "", "Suite / Run Name",
              "Start Date", "", "End Date", "", "Status"],
-            COL_W
+            self.COL_W
         )):
             hdr_row.columnconfigure(c, minsize=px)
             tk.Label(hdr_row, text=txt,
@@ -518,12 +520,8 @@ class App(tk.Tk):
                                         command=self._canvas.yview)
         self._scroll_fr = tk.Frame(self._canvas, bg=self.SURFACE)
 
-        self._scroll_fr.bind(
-            "<Configure>",
-            self._on_scroll_frame_configure
-        )
+        self._scroll_fr.bind("<Configure>", self._on_scroll_frame_configure)
         self._canvas.create_window((0, 0), window=self._scroll_fr, anchor="nw")
-        # scroll_fr 너비를 캔버스 너비에 맞게 항상 동기화
         self._canvas.bind(
             "<Configure>",
             lambda e: self._canvas.itemconfig(
@@ -535,7 +533,6 @@ class App(tk.Tk):
         self._scrollbar.pack(side="right", fill="y")
         self._canvas.bind_all("<MouseWheel>", self._on_mousewheel)
 
-        # 하단 액션 바
         foot = tk.Frame(self, bg=self.SURFACE,
                         padx=16, pady=10,
                         highlightbackground=self.BORDER,
@@ -572,39 +569,34 @@ class App(tk.Tk):
         self._lbl_loading.config(text="Loading...", fg=self.SUBTEXT)
         self.update()
         try:
-            # ① Test Plan 검색 (기존)
-            plan_data = api_get(f"get_plans/{PROJECT_ID}&is_completed=0&limit=100")
-            raw_plans = plan_data.get("plans", [])
-
-            # ② Milestone 검색 (추가) — Milestone 안의 Run도 포함
-            ms_data  = api_get(f"get_milestones/{PROJECT_ID}&is_completed=0")
-            ms_list  = ms_data.get("milestones", [])
+            # [fix6] 페이지네이션 적용
+            raw_plans = api_get_paged(
+                f"get_plans/{PROJECT_ID}&is_completed=0", "plans")
+            ms_list   = api_get_paged(
+                f"get_milestones/{PROJECT_ID}&is_completed=0", "milestones")
         except Exception as e:
             messagebox.showerror("Error", f"API connection failed:\n{e}")
             self._lbl_loading.config(text="Connection failed", fg=self.RED)
             return
 
-        # Milestone ID → 표시 이름 맵
         ms_map = {}
         for m in ms_list:
             ms_map[m["id"]] = m["name"]
             for sub in m.get("milestones", []):
                 ms_map[sub["id"]] = f"{m['name']} > {sub['name']}"
 
-        # ── Test Plan 목록 구성 ──────────────────
-        combined   = []   # {"label": ..., "type": "plan"|"run", "id": ..., "name": ...}
+        combined = []
         for p in raw_plans:
             ms_name = ms_map.get(p.get("milestone_id"), "")
             ms_tag  = f"  [{ms_name}]" if ms_name else ""
             combined.append({
-                "label" : f"[Plan] {p['name']}{ms_tag}  (ID: {p['id']})",
+                "label" : f"[Plan] {p['name']}{ms_tag}",
                 "type"  : "plan",
                 "id"    : p["id"],
                 "name"  : p["name"],
             })
 
-        # ── Milestone 안의 Run 목록 추가 ─────────
-        ms_run_count = 0
+        ms_run_count      = 0
         all_milestone_ids = []
         for m in ms_list:
             all_milestone_ids.append(m["id"])
@@ -614,8 +606,9 @@ class App(tk.Tk):
         seen_run_ids = set()
         for ms_id in all_milestone_ids:
             try:
-                run_data = api_get(f"get_runs/{PROJECT_ID}&milestone_id={ms_id}&limit=250")
-                runs     = run_data.get("runs", [])
+                # [fix6] 페이지네이션 적용
+                runs = api_get_paged(
+                    f"get_runs/{PROJECT_ID}&milestone_id={ms_id}", "runs")
                 for r in runs:
                     if r["id"] in seen_run_ids:
                         continue
@@ -623,20 +616,21 @@ class App(tk.Tk):
                     ms_label = ms_map.get(ms_id, "")
                     ms_tag   = f"  [{ms_label}]" if ms_label else ""
                     combined.append({
-                        "label" : f"[Run]  {r['name']}{ms_tag}  (ID: {r['id']})",
-                        "type"  : "run",
-                        "id"    : r["id"],
-                        "name"  : r["name"],
-                        "milestone_id": ms_id,
+                        "label"        : f"[Run]  {r['name']}{ms_tag}",
+                        "type"         : "run",
+                        "id"           : r["id"],
+                        "name"         : r["name"],
+                        "milestone_id" : ms_id,
                     })
                     ms_run_count += 1
             except Exception:
                 pass
 
-        # ── 독립 Test Run 추가 (Plan/Milestone 미포함 Run 전부 로드) ──
+        # 독립 Test Run (Plan/Milestone 미포함)
         try:
-            all_runs_data = api_get(f"get_runs/{PROJECT_ID}&limit=250")
-            for r in all_runs_data.get("runs", []):
+            # [fix6] 페이지네이션 적용
+            all_runs = api_get_paged(f"get_runs/{PROJECT_ID}", "runs")
+            for r in all_runs:
                 if r["id"] in seen_run_ids:
                     continue
                 seen_run_ids.add(r["id"])
@@ -644,11 +638,11 @@ class App(tk.Tk):
                 ms_label = ms_map.get(ms_id, "") if ms_id else ""
                 ms_tag   = f"  [{ms_label}]" if ms_label else ""
                 combined.append({
-                    "label" : f"[Run]  {r['name']}{ms_tag}  (ID: {r['id']})",
-                    "type"  : "run",
-                    "id"    : r["id"],
-                    "name"  : r["name"],
-                    "milestone_id": ms_id,
+                    "label"        : f"[Run]  {r['name']}{ms_tag}  (ID: {r['id']})",
+                    "type"         : "run",
+                    "id"           : r["id"],
+                    "name"         : r["name"],
+                    "milestone_id" : ms_id,
                 })
                 ms_run_count += 1
         except Exception:
@@ -657,7 +651,14 @@ class App(tk.Tk):
         self._plans = combined
         labels = [c["label"] for c in combined]
 
+        # [fix7] Refresh 후 현재 선택 플랜 유지
+        prev_label = self._plan_var.get()
+
         self._plan_cb["values"] = labels
+        # [fix8] 긴 플랜 이름이 짤리지 않도록 가장 긴 라벨 길이에 맞춰 너비 자동 조정
+        if labels:
+            max_w = max(len(l) for l in labels)
+            self._plan_cb.configure(width=min(max_w, 100))
         total = len(combined)
 
         if total == 0:
@@ -671,7 +672,11 @@ class App(tk.Tk):
             text=f"{total} found  (plans: {len(raw_plans)}, runs: {ms_run_count})",
             fg=self.GREEN
         )
-        self._plan_cb.current(0)
+
+        if prev_label and prev_label in labels:
+            self._plan_cb.current(labels.index(prev_label))
+        else:
+            self._plan_cb.current(0)
         self._on_plan_selected()
 
     def _on_plan_selected(self, event=None):
@@ -685,7 +690,6 @@ class App(tk.Tk):
             self._load_entries_from_run(selected)
 
     def _load_entries_from_plan(self, plan_id):
-        """기존 Test Plan 방식 — plan entry 단위로 로드"""
         self._lbl_status.config(text="Loading runs...", fg=self.SUBTEXT)
         self.update()
         try:
@@ -713,7 +717,6 @@ class App(tk.Tk):
         )
 
     def _load_entries_from_run(self, run_item):
-        """Milestone 안의 Run — get_run API로 직접 로드"""
         self._lbl_status.config(text="Loading run...", fg=self.SUBTEXT)
         self.update()
         try:
@@ -733,11 +736,8 @@ class App(tk.Tk):
         }]
 
         self._render_runs()
-        self._lbl_status.config(
-            text=f"1 run loaded  (Milestone Run)", fg=self.GREEN
-        )
+        self._lbl_status.config(text="1 run loaded  (Milestone Run)", fg=self.GREEN)
 
-    # 하위 호환용 alias
     def _load_entries(self, plan_id):
         self._load_entries_from_plan(plan_id)
 
@@ -766,7 +766,6 @@ class App(tk.Tk):
             row_bg    = self.SURFACE if i % 2 == 0 else self.ROW_ALT
             bar_color = self.ROW_COLORS[i % len(self.ROW_COLORS)]
 
-            # 구분선 (row 0은 없음)
             divider_fr = None
             if i > 0:
                 divider_fr = tk.Frame(self._scroll_fr, bg=self.BORDER, height=1)
@@ -774,43 +773,39 @@ class App(tk.Tk):
 
             row_fr = tk.Frame(self._scroll_fr, bg=row_bg)
             row_fr.pack(fill="x")
-            # 헤더와 동일한 컬럼 너비 적용
-            COL_W = [5, 28, 30, 220, 110, 30, 110, 30, 90]
-            for _c, _px in enumerate(COL_W):
+            for _c, _px in enumerate(self.COL_W):
                 row_fr.columnconfigure(_c, minsize=_px)
 
             chk_var = tk.BooleanVar(value=True)
 
-            # col 0 : 좌측 컬러 인디케이터 바
+            # c0: 좌측 컬러 인디케이터 바
             tk.Frame(row_fr, bg=bar_color, width=5).grid(
                 row=0, column=0, sticky="ns", ipady=14)
 
-            # col 1 : 체크박스
+            # c1: 체크박스
             tk.Checkbutton(row_fr, variable=chk_var,
                            bg=row_bg, activebackground=row_bg,
                            cursor="hand2"
                            ).grid(row=0, column=1, padx=(4, 0), pady=8)
 
-            # col 2 : 번호 배지
+            # c2: 번호 배지
             tk.Label(row_fr, text=f"{i+1:02d}",
                      bg=bar_color, fg="white",
                      font=("Segoe UI", 8, "bold"),
                      width=3, padx=2, pady=2
                      ).grid(row=0, column=2, padx=(4, 0))
 
-            # col 3 : Run 이름
+            # c3: Run 이름
             tk.Label(row_fr, text=entry["name"],
                      bg=row_bg, fg=self.TEXT,
                      font=("Segoe UI", 10, "bold"), anchor="w",
                      padx=8).grid(row=0, column=3, sticky="ew")
 
-            # col 4 : Start Date 입력창
+            # c4: Start Date 입력창
             start_var = tk.StringVar()
             if entry.get("start_on"):
                 try:
-                    start_var.set(
-                        datetime.fromtimestamp(entry["start_on"]).strftime("%Y-%m-%d")
-                    )
+                    start_var.set(ts_to_date_str(entry["start_on"]))  # [fix5]
                 except Exception:
                     pass
 
@@ -823,7 +818,7 @@ class App(tk.Tk):
                      state="readonly"
                      ).grid(row=0, column=4, padx=(4, 2))
 
-            # col 5 : Start Date 달력 버튼
+            # c5: Start Date 달력 버튼
             tk.Button(row_fr, text="📅",
                       command=lambda sv=start_var: self._pick_date(sv, "Start Date"),
                       bg=row_bg, fg=self.ACCENT,
@@ -832,13 +827,11 @@ class App(tk.Tk):
                       activebackground=self.BTN_GHOST
                       ).grid(row=0, column=5, padx=(0, 10))
 
-            # col 6 : End Date 입력창
+            # c6: End Date 입력창
             end_var = tk.StringVar()
             if entry.get("due_on"):
                 try:
-                    end_var.set(
-                        datetime.fromtimestamp(entry["due_on"]).strftime("%Y-%m-%d")
-                    )
+                    end_var.set(ts_to_date_str(entry["due_on"]))  # [fix5]
                 except Exception:
                     pass
 
@@ -851,7 +844,7 @@ class App(tk.Tk):
                      state="readonly"
                      ).grid(row=0, column=6, padx=(4, 2))
 
-            # col 7 : End Date 달력 버튼
+            # c7: End Date 달력 버튼
             tk.Button(row_fr, text="📅",
                       command=lambda ev=end_var: self._pick_date(ev, "End Date"),
                       bg=row_bg, fg=self.ACCENT,
@@ -860,7 +853,7 @@ class App(tk.Tk):
                       activebackground=self.BTN_GHOST
                       ).grid(row=0, column=7, padx=(0, 8))
 
-            # col 8 : 저장 상태 라벨
+            # c8: 저장 상태 라벨
             status_lbl = tk.Label(row_fr, text="",
                                    bg=row_bg, fg=self.SUBTEXT,
                                    font=("Segoe UI", 9), width=10, anchor="w")
@@ -887,18 +880,15 @@ class App(tk.Tk):
             ]
             self._validate_row(row_data)
 
-        # 행 생성 완료 후 검색어 초기화
         self._search_var.set("")
 
     # ── Select All / Deselect All ────────────
     def _select_all(self):
-        # [fix2] 필터로 숨겨진 행 제외
         for row in self._run_rows:
             if row["row_fr"].winfo_ismapped():
                 row["chk_var"].set(True)
 
     def _deselect_all(self):
-        # [fix2] 필터로 숨겨진 행 제외
         for row in self._run_rows:
             if row["row_fr"].winfo_ismapped():
                 row["chk_var"].set(False)
@@ -913,7 +903,6 @@ class App(tk.Tk):
                 "Please select at least one date in the Bulk Date fields.")
             return
 
-        # Start > End 검증
         if s and e:
             try:
                 if datetime.strptime(s, "%Y-%m-%d") > datetime.strptime(e, "%Y-%m-%d"):
@@ -923,7 +912,6 @@ class App(tk.Tk):
             except ValueError:
                 pass
 
-        # [fix2] 가시 행 + 체크된 행에만 적용
         targets = [r for r in self._run_rows
                    if r["chk_var"].get() and r["row_fr"].winfo_ismapped()]
         if not targets:
@@ -943,13 +931,11 @@ class App(tk.Tk):
             fg="#856404"
         )
 
-
     # =============================================
     # v2 신규 메서드
     # =============================================
 
     def _validate_row(self, row):
-        """Start > End 이면 상태 라벨에 경고 표시, 정상이면 경고 제거."""
         s = row["start_var"].get()
         e = row["end_var"].get()
         lbl = row.get("status_lbl")
@@ -966,7 +952,6 @@ class App(tk.Tk):
             lbl.config(text="", fg=self.SUBTEXT)
 
     def _collect_invalid_rows(self, targets):
-        """저장 전 날짜 역전 / 포맷 오류 검사 -> 에러 메시지 목록 반환."""
         errors = []
         for row in targets:
             s = row["start_var"].get()
@@ -982,7 +967,6 @@ class App(tk.Tk):
         return errors
 
     def _filter_runs(self, *args):
-        """검색어 일치 행만 표시. pack_forget-all -> repack 으로 표시 순서 보존."""
         if not self._run_rows:
             self._lbl_filter_count.config(text="", fg=self.SUBTEXT)
             return
@@ -1012,45 +996,49 @@ class App(tk.Tk):
             self._lbl_filter_count.config(text=str(total), fg=self.SUBTEXT)
 
     def _auto_assign_dates(self):
-        """체크된 가시 Run에 시작일 + N일 기간 + gap일 간격으로 날짜 순차 배분."""
+        # [fix8] 메시지 영어로 통일
         start_str = self._auto_start_var.get()
         if not start_str:
-            messagebox.showwarning("Warning", "Auto-Date: Start Date를 먼저 선택해주세요.")
+            messagebox.showwarning("Warning",
+                "Please select a Start Date for Auto-Date first.")
             return
         try:
             days = int(self._auto_days_var.get())
             if days < 1:
                 raise ValueError
         except ValueError:
-            messagebox.showerror("Error", "Days는 1 이상의 정수를 입력해주세요.")
+            messagebox.showerror("Error", "Days must be an integer ≥ 1.")
             return
         try:
             gap = int(self._auto_gap_var.get())
             if gap < 0:
                 raise ValueError
         except ValueError:
-            messagebox.showerror("Error", "Gap은 0 이상의 정수를 입력해주세요.")
+            messagebox.showerror("Error", "Gap must be an integer ≥ 0.")
             return
         try:
             base_start = datetime.strptime(start_str, "%Y-%m-%d").date()
         except ValueError:
-            messagebox.showerror("Error", "Auto-Date Start 날짜 형식 오류 (YYYY-MM-DD)")
+            messagebox.showerror("Error",
+                "Invalid date format for Auto-Date Start (YYYY-MM-DD).")
             return
-        # [fix2] 가시 행 + 체크된 행에만 적용
+
         targets = [r for r in self._run_rows
                    if r["chk_var"].get() and r["row_fr"].winfo_ismapped()]
         if not targets:
             messagebox.showwarning("Warning",
-                "체크된 Run이 없거나 현재 필터에 표시된 Run이 없습니다.")
+                "No checked runs visible in the current filter.")
             return
+
         cursor = base_start
         for row in targets:
             run_end = cursor + timedelta(days=days - 1)
             row["start_var"].set(cursor.strftime("%Y-%m-%d"))
             row["end_var"].set(run_end.strftime("%Y-%m-%d"))
             cursor = run_end + timedelta(days=gap + 1)
+
         self._lbl_status.config(
-            text=f"Auto-Date: {len(targets)} run(s) 배분 완료  —  Save 버튼으로 저장",
+            text=f"Auto-Date: {len(targets)} run(s) assigned  —  click Save to confirm",
             fg="#856404")
 
     # ── 달력 팝업 ─────────────────────────────
@@ -1069,13 +1057,21 @@ class App(tk.Tk):
 
     # ── 저장 ──────────────────────────────────
     def _save_dates(self):
-        targets = [r for r in self._run_rows if r["chk_var"].get()]
+        # [fix4] 가시 행만 대상
+        targets = [r for r in self._run_rows
+                   if r["chk_var"].get() and r["row_fr"].winfo_ismapped()]
         if not targets:
             messagebox.showwarning("Warning", "No runs selected.")
             return
 
-        # [v2] 날짜 역전 / 포맷 오류 사전 검사
+        # [fix3] 날짜 역전 / 포맷 오류 사전 검사 후 차단
         errors = self._collect_invalid_rows(targets)
+        if errors:
+            messagebox.showerror(
+                "Date Error",
+                "Please fix the following before saving:\n\n" + "\n".join(errors)
+            )
+            return
 
         if not messagebox.askyesno("Confirm Save",
                                     f"Save dates for {len(targets)} run(s)?"):
@@ -1096,21 +1092,13 @@ class App(tk.Tk):
 
             payload = {}
             if start_str:
-                payload["start_on"] = int(
-                    datetime.strptime(start_str, "%Y-%m-%d").timestamp()
-                )
+                payload["start_on"] = date_str_to_ts(start_str)  # [fix5]
             if end_str:
-                payload["due_on"] = int(
-                    datetime.strptime(end_str, "%Y-%m-%d").timestamp()
-                )
+                payload["due_on"] = date_str_to_ts(end_str)       # [fix5]
 
             try:
-                # Plan Entry vs Milestone Run 구분하여 API 호출
                 if entry.get("source") == "run" or not entry.get("entry_id"):
-                    resp = api_post(
-                        f"update_run/{entry['run_id']}",
-                        payload
-                    )
+                    resp = api_post(f"update_run/{entry['run_id']}", payload)
                 else:
                     resp = api_post(
                         f"update_plan_entry/{entry['plan_id']}/{entry['entry_id']}",
@@ -1148,13 +1136,9 @@ class App(tk.Tk):
 
     # ── 스크롤 ────────────────────────────────
     def _on_scroll_frame_configure(self, event):
-        """scrollregion 만 업데이트 — 창/캔버스 크기는 고정"""
-        self._canvas.configure(
-            scrollregion=self._canvas.bbox("all")
-        )
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
 
     def _on_mousewheel(self, event):
-        # 컨텐츠가 캔버스보다 작으면 스크롤 무시
         content_h = self._scroll_fr.winfo_reqheight()
         canvas_h  = self._canvas.winfo_height()
         if content_h <= canvas_h:
@@ -1168,7 +1152,6 @@ class App(tk.Tk):
         sh = self.winfo_screenheight()
         w  = self.winfo_width()
         h  = self.winfo_height()
-        # 크기는 건드리지 않고 위치만 중앙으로
         self.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
 
 
